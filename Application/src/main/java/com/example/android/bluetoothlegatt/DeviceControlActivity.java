@@ -26,7 +26,9 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Message;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -60,6 +62,11 @@ public class DeviceControlActivity extends Activity {
     private ArrayList<ArrayList<BluetoothGattCharacteristic>> mGattCharacteristics =
             new ArrayList<ArrayList<BluetoothGattCharacteristic>>();
     private boolean mConnected = false;
+    private boolean testStarted;
+    private int connectCount = 0;
+    private int disconnectCount = 0;
+
+    private RunTestHandler runTestHandler = new RunTestHandler();
     private BluetoothGattCharacteristic mNotifyCharacteristic;
 
     private final String LIST_NAME = "NAME";
@@ -96,19 +103,30 @@ public class DeviceControlActivity extends Activity {
         public void onReceive(Context context, Intent intent) {
             final String action = intent.getAction();
             if (BluetoothLeService.ACTION_GATT_CONNECTED.equals(action)) {
+                runTestHandler.setConnected(true);
+
+                connectCount++;
                 mConnected = true;
                 updateConnectionState(R.string.connected);
                 invalidateOptionsMenu();
+                Log.d(TAG, "mGattUpdateReceiver Connected");
             } else if (BluetoothLeService.ACTION_GATT_DISCONNECTED.equals(action)) {
+                runTestHandler.setConnected(false);
+
+                disconnectCount++;
                 mConnected = false;
                 updateConnectionState(R.string.disconnected);
                 invalidateOptionsMenu();
-                clearUI();
+                clearUI(true);
+                Log.d(TAG, "mGattUpdateReceiver disconnected");
+                mBluetoothLeService.close();
             } else if (BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED.equals(action)) {
                 // Show all the supported services and characteristics on the user interface.
                 displayGattServices(mBluetoothLeService.getSupportedGattServices());
+                Log.d(TAG, "mGattUpdateReceiver Service discovered");
             } else if (BluetoothLeService.ACTION_DATA_AVAILABLE.equals(action)) {
                 displayData(intent.getStringExtra(BluetoothLeService.EXTRA_DATA));
+                Log.d(TAG, "mGattUpdateReceiver Data available");
             }
         }
     };
@@ -147,9 +165,14 @@ public class DeviceControlActivity extends Activity {
                 }
     };
 
-    private void clearUI() {
-        mGattServicesList.setAdapter((SimpleExpandableListAdapter) null);
-        mDataField.setText(R.string.no_data);
+    private void clearUI(boolean fromDisconnected) {
+        if (fromDisconnected) {
+            mGattServicesList.setAdapter((SimpleExpandableListAdapter) null);
+        }
+
+        //mDataField.setText(R.string.no_data);
+        mDataField.setText(String.format("Count [%d][%d]. start(%d), timeout(%d)",
+                connectCount, disconnectCount, runTestHandler.getStartCount(), runTestHandler.getTimeoutCount()));
     }
 
     @Override
@@ -195,6 +218,7 @@ public class DeviceControlActivity extends Activity {
         super.onDestroy();
         unbindService(mServiceConnection);
         mBluetoothLeService = null;
+        runTestHandler.removeMessages(MSG_TIME_OUT);
     }
 
     @Override
@@ -207,6 +231,11 @@ public class DeviceControlActivity extends Activity {
             menu.findItem(R.id.menu_connect).setVisible(true);
             menu.findItem(R.id.menu_disconnect).setVisible(false);
         }
+        if (testStarted) {
+            menu.findItem(R.id.menu_test_startstop).setTitle("Stop test");
+        } else {
+            menu.findItem(R.id.menu_test_startstop).setTitle("Start test");
+        }
         return true;
     }
 
@@ -218,6 +247,15 @@ public class DeviceControlActivity extends Activity {
                 return true;
             case R.id.menu_disconnect:
                 mBluetoothLeService.disconnect();
+                return true;
+            case R.id.menu_test_startstop:
+                if (testStarted) {
+                    runTestHandler.StartStopTest(false);
+                } else {
+                    runTestHandler.StartStopTest(true);
+                }
+                testStarted = !testStarted;
+                invalidateOptionsMenu();
                 return true;
             case android.R.id.home:
                 onBackPressed();
@@ -305,5 +343,81 @@ public class DeviceControlActivity extends Activity {
         intentFilter.addAction(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED);
         intentFilter.addAction(BluetoothLeService.ACTION_DATA_AVAILABLE);
         return intentFilter;
+    }
+
+    final int MSG_START = 1;
+    final int MSG_STOP = 100;
+    final int MSG_TIME_OUT = 101;
+
+    class RunTestHandler extends Handler {
+        final int TIME_OUT = 6000;
+        boolean running;
+        int startCount;
+        int timeoutCount = 0;
+        boolean connected;
+        public void StartStopTest(boolean start) {
+            removeMessages(MSG_START);
+            removeMessages(MSG_STOP);
+
+            running = start;
+            if (start) {
+                startCount = 0;
+                timeoutCount = 0;
+                if (connected) {
+                    sendEmptyMessage(MSG_STOP);
+                } else {
+                    sendEmptyMessage(MSG_START);
+                }
+            } else {
+                //sendEmptyMessage(MSG_STOP);
+            }
+        }
+        @Override
+        public void handleMessage(Message msg) {
+            Log.i(TAG, String.format("Msg[%d] (%d)(%d). start(%d), onConnection timeout(%d)", msg.what,
+                    connectCount, disconnectCount, startCount, timeoutCount));
+            switch (msg.what) {
+                case MSG_START:
+                    startCount++;
+                    mBluetoothLeService.connect(mDeviceAddress);
+                    sendEmptyMessageDelayed(MSG_TIME_OUT, TIME_OUT);
+                    break;
+                case MSG_STOP:
+                    mBluetoothLeService.disconnect();
+                    break;
+                case MSG_TIME_OUT:
+                    Log.e(TAG, "onConnection Time out");
+                    timeoutCount++;
+                    clearUI(false);
+                    if (mBluetoothLeService != null) {
+                        mBluetoothLeService.disconnect();
+                        mBluetoothLeService.close();
+                        sendEmptyMessageDelayed(MSG_START, 1500);
+                    }
+                    break;
+            }
+        }
+
+        public void setConnected(boolean connected) {
+            this.connected = connected;
+            removeMessages(MSG_TIME_OUT);
+            if (running) {
+                removeMessages(MSG_START);
+                removeMessages(MSG_STOP);
+                if (connected) {
+                    sendEmptyMessageDelayed(MSG_STOP, 3500);
+                } else {
+                    sendEmptyMessageDelayed(MSG_START, 1500);
+                }
+            }
+        }
+
+        public int getStartCount() {
+            return startCount;
+        }
+
+        public int getTimeoutCount() {
+            return timeoutCount;
+        }
     }
 }
